@@ -197,7 +197,7 @@ struct rtpe_ctx {
 
 
 struct ng_flags_parse {
-	int via, to, packetize, transport;
+	int via, to, packetize, transport, directional;
 	bencode_item_t *dict, *flags, *direction, *replace, *rtcp_mux;
 	str call_id, from_tag, to_tag, received_from;
 	str viabranch;
@@ -296,7 +296,7 @@ static int fixup_set_id(void ** param);
 static int fixup_free_set_id(void ** param);
 static int set_rtpengine_set_f(struct sip_msg * msg, rtpe_set_link_t *set_param);
 static struct rtpe_set * select_rtpe_set(int id_set);
-static struct rtpe_node *select_rtpe_node(str, int, struct rtpe_set *);
+static struct rtpe_node *select_rtpe_node(str, struct rtpe_set *);
 static char *send_rtpe_command(struct rtpe_node *, bencode_item_t *, int *);
 static int get_extra_id(struct sip_msg* msg, str *id_str);
 
@@ -330,6 +330,7 @@ static int rtpengine_stats_used = 0;
 static int rtpengine_disable_tout = 60;
 static int rtpengine_retr = 5;
 static int rtpengine_tout = 1;
+static int rtpengine_timer_interval = 5;
 static pid_t mypid;
 static int myrand = 0;
 static unsigned int myseqn = 0;
@@ -637,6 +638,7 @@ static param_export_t params[] = {
 	{"rtpengine_disable_tout", INT_PARAM, &rtpengine_disable_tout },
 	{"rtpengine_retr",         INT_PARAM, &rtpengine_retr         },
 	{"rtpengine_tout",         INT_PARAM, &rtpengine_tout         },
+  {"rtpengine_timer_interval", INT_PARAM, &rtpengine_timer_interval},
 	{"notification_sock",      STR_PARAM, &rtpengine_notify_sock.s},
 	{"extra_id_pv",            STR_PARAM, &extra_id_pv_param.s },
 	{"setid_avp",              STR_PARAM, &setid_avp_param },
@@ -1201,13 +1203,36 @@ static mi_response_t *mi_teardown_call(const mi_params_t *params,
 	return init_mi_result_ok();
 }
 
+/*
+ * Timer housekeeping, invoked each timer interval to check for proxy re-enablement
+ */
+void rtpengine_timer(unsigned int ticks, void *param)
+{
+  struct rtpe_set *rtpe_list;
+  struct rtpe_node *crt_rtpe;
+
+  if (*rtpe_set_list == NULL)
+    return;
+
+  RTPE_START_READ();
+  for(rtpe_list = (*rtpe_set_list)->rset_first; rtpe_list != NULL;
+					rtpe_list = rtpe_list->rset_next){
+		for(crt_rtpe = rtpe_list->rn_first; crt_rtpe != NULL;
+						crt_rtpe = crt_rtpe->rn_next){      
+      if (crt_rtpe->rn_disabled && crt_rtpe->rn_recheck_ticks <= get_ticks())
+        crt_rtpe->rn_disabled = rtpe_test(crt_rtpe, 0, 1);
+    }
+  }
+  RTPE_STOP_READ();
+}
+
 /* hack to get the rtpengine node used for the offer */
 static pv_spec_t media_pvar;
 
 static int mod_preinit(void)
 {
 	static str rtpengine_relay_pvar_str = str_init("$var(___rtpengine_relay_var__)");
-	struct rtp_relay_binds binds = {
+	struct rtp_relay_funcs binds = {
 		.offer = rtpengine_api_offer,
 		.answer = rtpengine_api_answer,
 		.delete = rtpengine_api_delete,
@@ -1374,6 +1399,11 @@ mod_init(void)
 				" command will not work\n");
 		memset(&dlgb, 0, sizeof(struct dlg_binds));
 	}
+
+  if (register_timer("rtpengine-timer", rtpengine_timer, NULL, rtpengine_timer_interval, TIMER_FLAG_DELAY_ON_DELAY) <0 ) {
+    LM_ERR("could not register timer function\n");
+    return -1;
+  }
 
 	return 0;
 }
@@ -1659,8 +1689,8 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 					ng_flags->transport |= 0x100;
 					ng_flags->transport &= ~0x002;
 				} else
-					break;
-				continue;
+					continue;
+				break;
 
 			case 4:
 				if (str_eq(&key, "SRTP"))
@@ -1668,8 +1698,8 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 				else if (str_eq(&key, "AVPF"))
 					ng_flags->transport |= 0x102;
 				else
-					break;
-				continue;
+					continue;
+				break;
 
 			case 6:
 				if (str_eq(&key, "to-tag")) {
@@ -1679,8 +1709,8 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 				} else if (str_eq(&key, "callid") && val.s)
 					ng_flags->call_id = val;
 				else
-					break;
-				continue;
+					continue;
+				break;
 
 			case 7:
 				if (str_eq(&key, "RTP/AVP"))
@@ -1691,8 +1721,8 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 						goto error;
 					ng_flags->call_id = val;
 				} else
-					break;
-				continue;
+					continue;
+				break;
 
 			case 8:
 				if (str_eq(&key, "internal")) {
@@ -1717,10 +1747,11 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 					if (!val.s)
 						goto error;
 					ng_flags->from_tag = val;
+					ng_flags->directional = 1;
 				}
 				else
-					break;
-				continue;
+					continue;
+				break;
 
 			case 9:
 				if (str_eq(&key, "RTP/SAVPF"))
@@ -1728,8 +1759,8 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 				else if (str_eq(&key, "out-iface"))
 					outiface = val;
 				else
-					break;
-				continue;
+					continue;
+				break;
 
 			case 10:
 				if (str_eq(&key, "via-branch")) {
@@ -1745,9 +1776,9 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 						ng_flags->via = -1;
 					else
 						goto error;
-					continue;
+					break;
 				}
-				break;
+				continue;
 
 			case 11:
 				if (str_eq(&key, "repacketize")) {
@@ -1765,8 +1796,11 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 						goto error;
 					BCHECK(bencode_dictionary_add_integer(ng_flags->dict, "repacketize", ng_flags->packetize));
 					continue;
+				} else if (str_eq(&key, "directional")) {
+					ng_flags->directional = 1;
+					continue;
 				}
-				break;
+				continue;
 
 			case 12:
 				if (str_eq(&key, "force-answer")) {
@@ -1787,8 +1821,8 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 						BCHECK(bencode_dictionary_add_integer(ng_flags->dict, "delete-delay", delete_delay));
 					}
 				} else
-					break;
-				continue;
+					continue;
+				break;
 			case 13:
 				if (str_eq(&key, "media-address")) {
 					err = "missing value";
@@ -1799,8 +1833,8 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 					if (val.s)
 						ng_flags->received_from = val;
 				} else
-					break;
-				continue;
+					continue;
+				break;
 
 			case 14:
 				if (str_eq(&key, "replace-origin")) {
@@ -1823,8 +1857,8 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 				else if (str_eq(&key, "rtcp-mux-offer"))
 					BCHECK(!ng_flags->rtcp_mux || bencode_list_add_string(ng_flags->rtcp_mux, "offer"));
 				else
-					break;
-				continue;
+					continue;
+				break;
 
 			case 15:
 				if (str_eq(&key, "rtcp-mux-reject"))
@@ -1832,8 +1866,8 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 				else if (str_eq(&key, "rtcp-mux-accept"))
 					BCHECK(!ng_flags->rtcp_mux || bencode_list_add_string(ng_flags->rtcp_mux, "accept"));
 				else
-					break;
-				continue;
+					continue;
+				break;
 
 			case 16:
 				if (str_eq(&key, "UDP/TLS/RTP/SAVP"))
@@ -1849,15 +1883,15 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 					else
 						BCHECK(bencode_list_add_string(ng_flags->replace, "username"));
 				} else
-					break;
-				continue;
+					continue;
+				break;
 
 			case 17:
 				if (str_eq(&key, "UDP/TLS/RTP/SAVPF"))
 					ng_flags->transport = 0x105;
 				else
-					break;
-				continue;
+					continue;
+				break;
 
 			case 19:
 				if (str_eq(&key, "replace-SDP-version")) {
@@ -1866,8 +1900,8 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 					else
 						BCHECK(bencode_list_add_string(ng_flags->replace, "SDP version"));
 				} else
-					break;
-				continue;
+					continue;
+				break;
 
 			case 20:
 				if (str_eq(&key, "replace-zero-address")) {
@@ -1881,8 +1915,8 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 					else
 						BCHECK(bencode_list_add_string(ng_flags->replace, "session name"));
 				} else
-					break;
-				continue;
+					continue;
+				break;
 
 			case 26:
 				if (str_eq(&key, "replace-session-connection")) {
@@ -1891,8 +1925,8 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 					else
 						BCHECK(bencode_list_add_string(ng_flags->replace, "session-connection"));
 				} else
-					break;
-				continue;
+					continue;
+				break;
 		}
 
 		/* we got here if we didn't match something specific */
@@ -2087,10 +2121,16 @@ static bencode_item_t *rtpe_function_call(bencode_buffer_t *bencbuf, struct sip_
 		}
 	}
 
-	if (msg && ((msg->first_line.type == SIP_REQUEST && op != OP_ANSWER)
+	if (op == OP_START_MEDIA || op == OP_STOP_MEDIA ||
+			op == OP_BLOCK_MEDIA || op == OP_UNBLOCK_MEDIA ||
+			op == OP_BLOCK_DTMF || op == OP_UNBLOCK_DTMF ||
+			op == OP_START_FORWARD || op == OP_STOP_FORWARD) {
+		if (ng_flags.directional)
+			bencode_dictionary_add_str(ng_flags.dict, "from-tag", &ng_flags.from_tag);
+	} else if (ng_flags.directional
+		|| (msg && ((msg->first_line.type == SIP_REQUEST && op != OP_ANSWER)
 		|| (msg->first_line.type == SIP_REPLY && op == OP_DELETE)
-		|| (msg->first_line.type == SIP_REPLY && op == OP_ANSWER)
-		|| (msg->first_line.type == SIP_REPLY && op == OP_STOP_MEDIA)))
+		|| (msg->first_line.type == SIP_REPLY && op == OP_ANSWER))))
 	{
 		bencode_dictionary_add_str(ng_flags.dict, "from-tag", &ng_flags.from_tag);
 		if (op != OP_START_MEDIA && op != OP_STOP_MEDIA) {
@@ -2124,10 +2164,10 @@ static bencode_item_t *rtpe_function_call(bencode_buffer_t *bencbuf, struct sip_
 	do {
 		if (snode && snode->s) {
 			if ((node = get_rtpe_node(snode, set)) == NULL)
-				node = select_rtpe_node(ng_flags.call_id, 1, set);
+				node = select_rtpe_node(ng_flags.call_id, set);
 			snode = NULL;
 		} else {
-			node = select_rtpe_node(ng_flags.call_id, 1, set);
+			node = select_rtpe_node(ng_flags.call_id, set);
 		}
 		if (!node) {
 			LM_ERR("no available proxies\n");
@@ -2506,7 +2546,7 @@ static struct rtpe_set * select_rtpe_set(int id_set )
  * too expensive here.
  */
 static struct rtpe_node *
-select_rtpe_node(str callid, int do_test, struct rtpe_set *set)
+select_rtpe_node(str callid, struct rtpe_set *set)
 {
 	unsigned sum, weight_sum;
 	struct rtpe_node* node;
@@ -2526,11 +2566,8 @@ select_rtpe_node(str callid, int do_test, struct rtpe_set *set)
 	/* Most popular case: 1 proxy, nothing to calculate */
 	if (set->rtpe_node_count == 1) {
 		node = set->rn_first;
-		if (node->rn_disabled && node->rn_recheck_ticks <= get_ticks())
-			node->rn_disabled = rtpe_test(node, 1, 0);
 		if (node->rn_disabled)
 			return NULL;
-
 		return node;
 	}
 
@@ -2540,16 +2577,10 @@ select_rtpe_node(str callid, int do_test, struct rtpe_set *set)
 	sum &= 0xff;
 
 	was_forced = 0;
-retry:
 	weight_sum = 0;
 	constant_weight_sum = 0;
 	found = 0;
 	for (node=set->rn_first; node!=NULL; node=node->rn_next) {
-
-		if (node->rn_disabled && node->rn_recheck_ticks <= get_ticks()){
-			/* Try to enable if it's time to try. */
-			node->rn_disabled = rtpe_test(node, 1, 0);
-		}
 		constant_weight_sum += node->rn_weight;
 		if (!node->rn_disabled) {
 			weight_sum += node->rn_weight;
@@ -2557,14 +2588,7 @@ retry:
 		}
 	}
 	if (found == 0) {
-		/* No proxies? Force all to be re-detected, if not yet */
-		if (was_forced)
 			return NULL;
-		was_forced = 1;
-		for(node=set->rn_first; node!=NULL; node=node->rn_next) {
-			node->rn_disabled = rtpe_test(node, 1, 1);
-		}
-		goto retry;
 	}
 	sumcut = weight_sum ? sum % constant_weight_sum : -1;
 	/*
@@ -2575,7 +2599,7 @@ retry:
 	for (node=set->rn_first; node!=NULL;) {
 		if (sumcut < (int)node->rn_weight) {
 			if (!node->rn_disabled)
-				goto found;
+				return node;
 			if (was_forced == 0) {
 				/* appropriate proxy is disabled : redistribute on enabled ones */
 				sumcut = weight_sum ? sum %  weight_sum : -1;
@@ -2589,14 +2613,6 @@ retry:
 	}
 	/* No node list */
 	return NULL;
-found:
-	if (do_test) {
-		node->rn_disabled = rtpe_test(node, node->rn_disabled, 0);
-		if (node->rn_disabled)
-			goto retry;
-	}
-
-	return node;
 }
 
 static int
